@@ -1,7 +1,7 @@
 // Суммы в целых рублях. Единый список для клавиатуры и проверки callback.
 export const TOP_UP_AMOUNTS = Object.freeze([249, 349, 499, 799, 1499]);
 // Курс Telegram Stars: сколько рублей стоит одна звезда.
-export const RUB_PER_STAR = 1.7;
+export const RUB_PER_STAR = 1.3;
 
 export function isTopUpAmount(amount) {
   return Number.isSafeInteger(amount) && TOP_UP_AMOUNTS.includes(amount);

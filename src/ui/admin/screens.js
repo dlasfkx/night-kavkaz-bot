@@ -2,11 +2,14 @@ import { button, bold, emoji } from '../emoji.js';
 
 const backRow = () => [[button('Назад', 'admin_menu', { icon: 'back' })]];
 
-export function adminMenuScreen() {
+export function adminMenuScreen(maintenanceMode = false) {
   return {
     parts: [
       emoji('lock'), ' ', bold('Панель администратора'),
       '\nУправление ботом и пользователями.',
+      '\n\n', ...(maintenanceMode
+        ? [emoji('warning'), ' ', bold('Техработы включены: бот закрыт для пользователей.')]
+        : [emoji('check'), ' Бот работает в обычном режиме.']),
     ],
     rows: [
       [
@@ -21,6 +24,8 @@ export function adminMenuScreen() {
         button('Проверить пользователя', 'admin_lookup', { icon: 'question' }),
         button('Выдать баланс', 'admin_credit', { icon: 'diamond' }),
       ],
+      [button(maintenanceMode ? 'Выключить техработы' : 'Включить техработы', 'admin_maintenance_toggle',
+        { icon: maintenanceMode ? 'check' : 'warning', style: maintenanceMode ? 'success' : 'danger' })],
       [button('В главное меню', 'main_menu', { icon: 'back' })],
     ],
   };
@@ -38,14 +43,15 @@ function displayDate(value) {
     : 'нет данных';
 }
 
-export function adminUsersScreen({ items, page, pageSize, total, hasPrev, hasNext }) {
+export function adminUsersScreen({ items, page, pageSize, total, hasPrev, hasNext }, buyersOnly = false) {
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const parts = [
-    emoji('eyes'), ' ', bold('Пользователи'), '\n',
+    emoji('eyes'), ' ', bold(buyersOnly ? 'Покупатели' : 'Пользователи'), '\n',
     emoji('bullet'), ` Всего: ${total}\n`,
-    emoji('bullet'), ` Страница ${page + 1} из ${Math.max(1, Math.ceil(total / pageSize))}\n\n`,
+    emoji('bullet'), ` Страница ${page + 1} из ${pageCount}\n\n`,
   ];
   if (!items.length) {
-    parts.push('Пока нет зарегистрированных пользователей.');
+    parts.push(buyersOnly ? 'Пока нет пользователей с покупками.' : 'Пока нет зарегистрированных пользователей.');
   } else {
     items.forEach((user, index) => {
       const ordinal = page * pageSize + index + 1;
@@ -64,11 +70,19 @@ export function adminUsersScreen({ items, page, pageSize, total, hasPrev, hasNex
   }
   const rows = [];
   const navigation = [];
-  if (hasPrev) navigation.push(button('← Назад', `admin_users:${page - 1}`, { icon: 'back' }));
-  if (hasNext) navigation.push(button('Далее →', `admin_users:${page + 1}`));
+  const pageRoute = buyersOnly ? 'admin_buyers' : 'admin_users';
+  if (hasPrev) navigation.push(button('← Назад', `${pageRoute}:${page - 1}`, { icon: 'back' }));
+  if (hasNext) navigation.push(button('Далее →', `${pageRoute}:${page + 1}`));
   if (navigation.length) rows.push(navigation);
+  if (pageCount > 1) {
+    rows.push([button('Перейти к странице', `admin_users_goto:${page}:${buyersOnly ? 1 : 0}`, { icon: 'question' })]);
+  }
+  rows.push([
+    button(buyersOnly ? 'Показать всех пользователей' : 'Показать покупателей',
+      buyersOnly ? 'admin_users:0' : 'admin_buyers:0', { icon: buyersOnly ? 'eyes' : 'cart' }),
+  ]);
   rows.push(
-    [button('Обновить', `admin_users_refresh:${page}`, { icon: 'lightning' })],
+    [button('Обновить', `${buyersOnly ? 'admin_buyers' : 'admin_users'}_refresh:${page}`, { icon: 'lightning' })],
     [button('Назад', 'admin_menu', { icon: 'back' })],
   );
   return { parts, rows };
@@ -110,6 +124,9 @@ export function adminAdminsScreen(data) {
   if (hasPrev) nav.push(button('← Назад', `admin_admins:${page - 1}`, { icon: 'back' }));
   if (hasNext) nav.push(button('Далее →', `admin_admins:${page + 1}`));
   if (nav.length) rows.push(nav);
+  if (Math.max(1, Math.ceil(total / pageSize)) > 1) {
+    rows.push([button('Перейти к странице', `admin_admins_goto:${page}`, { icon: 'question' })]);
+  }
   rows.push([button('Обновить', `admin_admins_refresh:${page}`, { icon: 'lightning' })], ...backRow());
   return { parts, rows };
 }

@@ -79,6 +79,9 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
     const insertStarsTopUp = db.prepare(`INSERT INTO top_ups
       (telegram_id, method, amount, stars, status, telegram_charge_id) VALUES (?, 'stars', ?, ?, 'approved', ?)`);
     const isAdminQuery = db.prepare('SELECT 1 AS yes FROM admins WHERE telegram_id = ?');
+    const getMaintenanceModeQuery = db.prepare("SELECT value FROM app_meta WHERE key = 'maintenance_mode'");
+    const setMaintenanceModeQuery = db.prepare(`INSERT INTO app_meta (key, value) VALUES ('maintenance_mode', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
     const listAdminsQuery = db.prepare(`SELECT admins.telegram_id AS telegramId, admins.added_at AS addedAt,
       admins.added_by AS addedBy, users.username, users.first_name AS firstName, users.last_name AS lastName,
       users.registered_at AS registeredAt, users.balance,
@@ -113,6 +116,15 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
       registered_at AS registeredAt,
       (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount
       FROM users ORDER BY registered_at, telegram_id LIMIT ? OFFSET ?`);
+    const buyersCountQuery = db.prepare(`SELECT count(*) AS count FROM users
+      WHERE EXISTS (SELECT 1 FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed')`);
+    const pageBuyersQuery = db.prepare(`SELECT telegram_id AS telegramId, username,
+      first_name AS firstName, last_name AS lastName, balance,
+      registered_at AS registeredAt,
+      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount
+      FROM users WHERE EXISTS (
+        SELECT 1 FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed'
+      ) ORDER BY registered_at, telegram_id LIMIT ? OFFSET ?`);
     const updateProfileQuery = db.prepare(`INSERT INTO users
       (telegram_id, username, first_name, last_name, registered_at)
       VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -144,11 +156,29 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
     }
     // После падения процесса между списанием и выдачей ссылки деньги возвращаются при старте.
     for (const { id: pendingId } of allPendingPurchases.all()) revertPurchase(pendingId);
+    function pageUsers(buyersOnly, page = 0, pageSize = 5) {
+      if (!Number.isSafeInteger(page) || page < 0 || !Number.isSafeInteger(pageSize) ||
+          pageSize < 1 || pageSize > 10 || !Number.isSafeInteger(page * pageSize)) {
+        throw new TypeError('Некорректная страница пользователей.');
+      }
+      const total = (buyersOnly ? buyersCountQuery : userCountQuery).get().count;
+      const lastPage = Math.max(0, Math.ceil(total / pageSize) - 1);
+      const safePage = Math.min(page, lastPage);
+      const rows = (buyersOnly ? pageBuyersQuery : pageUsersQuery).all(pageSize + 1, safePage * pageSize);
+      return { items: rows.slice(0, pageSize), hasPrev: safePage > 0,
+        hasNext: rows.length > pageSize, page: safePage, pageSize, total };
+    }
     let closed = false;
     return {
       // Кешируется SQL, не результаты: каждый вызов читает текущую базу.
       get(id) { return getUser.get(telegramId(id)); },
       isAdmin(id) { return Boolean(isAdminQuery.get(telegramId(id))); },
+      isMaintenanceMode() { return getMaintenanceModeQuery.get()?.value === '1'; },
+      setMaintenanceMode(enabled) {
+        if (typeof enabled !== 'boolean') throw new TypeError('Режим техработ должен быть включён или выключен.');
+        setMaintenanceModeQuery.run(enabled ? '1' : '0');
+        return enabled;
+      },
       listAdmins() { return listAdminsQuery.all(); },
       listAdminPage(page = 0, pageSize = 5) {
         if (!Number.isSafeInteger(page) || page < 0 || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 10) {
@@ -198,16 +228,10 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
       listRegisteredUserIds() { return allUserIdsQuery.all().map(row => row.telegramId); },
       listOrdinaryUserIds() { return ordinaryUserIdsQuery.all().map(row => row.telegramId); },
       listUsers(page = 0, pageSize = 5) {
-        if (!Number.isSafeInteger(page) || page < 0 || !Number.isSafeInteger(pageSize) ||
-            pageSize < 1 || pageSize > 10 || !Number.isSafeInteger(page * pageSize)) {
-          throw new TypeError('Некорректная страница пользователей.');
-        }
-        const total = userCountQuery.get().count;
-        const lastPage = Math.max(0, Math.ceil(total / pageSize) - 1);
-        const safePage = Math.min(page, lastPage);
-        const rows = pageUsersQuery.all(pageSize + 1, safePage * pageSize);
-        return { items: rows.slice(0, pageSize), hasPrev: safePage > 0,
-          hasNext: rows.length > pageSize, page: safePage, pageSize, total };
+        return pageUsers(false, page, pageSize);
+      },
+      listBuyers(page = 0, pageSize = 5) {
+        return pageUsers(true, page, pageSize);
       },
       updateUserProfile(user) {
         const id = telegramId(user?.id);

@@ -1,5 +1,5 @@
 import {
-  welcomeScreen, menuScreen, profileScreen, productsScreen, errorScreen,
+  welcomeScreen, maintenanceScreen, menuScreen, profileScreen, productsScreen, errorScreen,
   topUpScreen, topUpMethodScreen, purchasesScreen, purchaseConfirmScreen,
   purchaseCompleteScreen, insufficientFundsText, changedPriceText, purchaseFailedText,
 } from '../ui/screens.js';
@@ -18,11 +18,29 @@ export function registerHandlers(bot, { store, transport, rulesVersion, channels
   }
   bot.use(async (ctx, next) => {
     // pre_checkout_query (оплата Stars) приходит без chat: пропускаем к обработчику платежей.
-    if (ctx.preCheckoutQuery) return next();
+    // Already completed Stars payments must still be credited during maintenance.
+    if (ctx.preCheckoutQuery) {
+      if (store.isMaintenanceMode() && !store.isAdmin(ctx.from?.id)) {
+        return ctx.answerPreCheckoutQuery(false, 'Бот временно на технических работах. Попробуйте позже.');
+      }
+      return next();
+    }
+    if (ctx.message?.successful_payment) return next();
     if (ctx.chat?.type !== 'private' || !ctx.from) {
       if (ctx.callbackQuery) await answerCallback(ctx, 'Откройте личный чат с ботом.');
       else if (ctx.message?.text?.startsWith('/start')) await ctx.reply(
         'Night Kavkaz работает в личных сообщениях. Откройте чат со мной и нажмите /start.');
+      return;
+    }
+    // During maintenance only admins can use the bot; tell users on every attempted interaction.
+    if (store.isMaintenanceMode() && !store.isAdmin(ctx.from.id)) {
+      const message = ctx.callbackQuery?.message || ctx.message;
+      if (ctx.callbackQuery) {
+        await answerCallback(ctx, 'Бот временно на технических работах.');
+        await transport.show(ctx, maintenanceScreen());
+      } else if (message) {
+        await transport.reply(ctx, maintenanceScreen());
+      }
       return;
     }
     // Save the latest Telegram profile and first-seen date for the admin user directory.

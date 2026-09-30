@@ -21,7 +21,7 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     await answerCallback(ctx, 'Доступ только для администраторов.', { show_alert: true });
   }
   async function showMenu(ctx) {
-    await transport.show(ctx, adminMenuScreen());
+    await transport.show(ctx, adminMenuScreen(store.isMaintenanceMode()));
   }
   async function removeIncomingMessage(ctx) {
     try { await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id); }
@@ -51,10 +51,10 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     }
     await transport.reply(ctx, screen);
   }
-  async function startInput(ctx, type, title, instructions) {
+  async function startInput(ctx, type, title, instructions, extraState = {}) {
     const message = ctx.callbackQuery?.message;
     const prompt = message ? { chatId: message.chat.id, messageId: message.message_id } : null;
-    const state = { type, createdAt: clock(), prompt };
+    const state = { type, createdAt: clock(), prompt, ...extraState };
     inputs.set(String(ctx.from.id), state);
     await answerCallback(ctx);
     await transport.show(ctx, adminPromptScreen(title, instructions));
@@ -67,6 +67,14 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     if (!admin(ctx)) return deny(ctx);
     inputs.delete(String(ctx.from.id));
     await answerCallback(ctx);
+    await showMenu(ctx);
+  });
+  bot.action('admin_maintenance_toggle', async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    inputs.delete(String(ctx.from.id));
+    drafts.delete(String(ctx.from.id));
+    const enabled = store.setMaintenanceMode(!store.isMaintenanceMode());
+    await answerCallback(ctx, enabled ? 'Технические работы включены.' : 'Технические работы выключены.');
     await showMenu(ctx);
   });
   bot.action('admin_cancel', async ctx => {
@@ -93,6 +101,12 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     await answerCallback(ctx);
     await transport.show(ctx, adminAdminsScreen(store.listAdminPage(page, 5)));
   }
+  bot.action(/^admin_admins_goto:(\d{1,6})$/, async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    await startInput(ctx, 'page_admins', 'Перейти к странице администраторов',
+      'Отправьте номер страницы, начиная с 1.',
+      { returnPage: Number(ctx.match[1]) });
+  });
   bot.action('admin_list', ctx => showAdmins(ctx));
   // Compatibility aliases for keyboards created by older builds.
   bot.action('admin_admins', ctx => showAdmins(ctx));
@@ -105,21 +119,43 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     await transport.show(ctx, adminAdminsScreen(store.listAdminPage(Number(ctx.match[1]), 5)));
   });
 
-  async function showUsers(ctx, page = 0) {
+  async function showUsers(ctx, page = 0, buyersOnly = false) {
     if (!admin(ctx)) return deny(ctx);
     inputs.delete(String(ctx.from.id));
     await answerCallback(ctx);
-    await transport.show(ctx, adminUsersScreen(store.listUsers(page, 5)));
+    const data = buyersOnly ? store.listBuyers(page, 5) : store.listUsers(page, 5);
+    await transport.show(ctx, adminUsersScreen(data, buyersOnly));
   }
+  bot.action(/^admin_users_goto:(\d{1,6}):(0|1)$/, async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    const buyersOnly = ctx.match[2] === '1';
+    await startInput(ctx, buyersOnly ? 'page_buyers' : 'page_users',
+      buyersOnly ? 'Перейти к странице покупателей' : 'Перейти к странице пользователей',
+      'Отправьте номер страницы, начиная с 1.',
+      { returnPage: Number(ctx.match[1]), buyersOnly });
+  });
+  // Legacy callback remains valid for keyboards from older messages.
+  bot.action(/^admin_users_goto:(\d{1,6})$/, async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    await startInput(ctx, 'page_users', 'Перейти к странице пользователей',
+      'Отправьте номер страницы, начиная с 1.', { returnPage: Number(ctx.match[1]), buyersOnly: false });
+  });
   bot.action('admin_users', ctx => showUsers(ctx));
-  // Keep old keyboards working during deployments that have not refreshed yet.
+  bot.action('admin_buyers', ctx => showUsers(ctx, 0, true));
   bot.action('admin_user_count', ctx => showUsers(ctx));
   bot.action(/^admin_users:(\d{1,6})$/, ctx => showUsers(ctx, Number(ctx.match[1])));
+  bot.action(/^admin_buyers:(\d{1,6})$/, ctx => showUsers(ctx, Number(ctx.match[1]), true));
   bot.action(/^admin_users_refresh:(\d{1,6})$/, async ctx => {
     if (!admin(ctx)) return deny(ctx);
     inputs.delete(String(ctx.from.id));
     await answerCallback(ctx, 'Данные обновлены.');
-    await transport.show(ctx, adminUsersScreen(store.listUsers(Number(ctx.match[1]), 5)));
+    await transport.show(ctx, adminUsersScreen(store.listUsers(Number(ctx.match[1]), 5), false));
+  });
+  bot.action(/^admin_buyers_refresh:(\d{1,6})$/, async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    inputs.delete(String(ctx.from.id));
+    await answerCallback(ctx, 'Данные обновлены.');
+    await transport.show(ctx, adminUsersScreen(store.listBuyers(Number(ctx.match[1]), 5), true));
   });
   bot.action('admin_lookup', async ctx => {
     if (!admin(ctx)) return deny(ctx);
@@ -191,7 +227,41 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     }
     if (text.toLowerCase() === '/cancel') {
       inputs.delete(actor);
-      await showInputResult(ctx, state, adminMenuScreen());
+      if (state.type === 'page_users' || state.type === 'page_buyers') {
+        const data = state.buyersOnly ? store.listBuyers(state.returnPage ?? 0, 5) : store.listUsers(state.returnPage ?? 0, 5);
+        return await showInputResult(ctx, state, adminUsersScreen(data, Boolean(state.buyersOnly)));
+      }
+      if (state.type === 'page_admins') return await showInputResult(ctx, state, adminAdminsScreen(store.listAdminPage(state.returnPage ?? 0, 5)));
+      await showInputResult(ctx, state, adminMenuScreen(store.isMaintenanceMode()));
+      return;
+    }
+    if (state.type === 'page_users' || state.type === 'page_buyers' || state.type === 'page_admins') {
+      const requestedPage = /^[1-9]\d{0,6}$/.test(text) ? Number(text) : NaN;
+      const getPage = state.type === 'page_admins' ? page => store.listAdminPage(page, 5)
+        : state.type === 'page_buyers' ? page => store.listBuyers(page, 5)
+          : page => store.listUsers(page, 5);
+      if (!Number.isSafeInteger(requestedPage)) {
+        await showInputResult(ctx, state, adminPromptScreen(
+          state.type === 'page_admins' ? 'Перейти к странице администраторов'
+            : state.type === 'page_buyers' ? 'Перейти к странице покупателей' : 'Перейти к странице пользователей',
+          'Введите целый номер страницы от 1 или /cancel.'));
+        inputs.set(actor, { ...state, createdAt: clock() });
+        return;
+      }
+      const totalPages = Math.max(1, Math.ceil(getPage(0).total / 5));
+      if (requestedPage > totalPages) {
+        await showInputResult(ctx, state, adminPromptScreen(
+          state.type === 'page_admins' ? 'Перейти к странице администраторов'
+            : state.type === 'page_buyers' ? 'Перейти к странице покупателей' : 'Перейти к странице пользователей',
+          `Страницы ${requestedPage} нет. Доступны страницы от 1 до ${totalPages}. Введите номер или /cancel.`));
+        inputs.set(actor, { ...state, createdAt: clock() });
+        return;
+      }
+      inputs.delete(actor);
+      const screen = state.type === 'page_admins'
+        ? adminAdminsScreen(getPage(requestedPage - 1))
+        : adminUsersScreen(getPage(requestedPage - 1), state.type === 'page_buyers');
+      await showInputResult(ctx, state, screen);
       return;
     }
     if (state.type === 'broadcast') {

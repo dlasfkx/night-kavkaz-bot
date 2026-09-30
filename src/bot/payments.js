@@ -187,7 +187,22 @@ export function registerPaymentHandlers(bot, { store, transport, rulesVersion, m
     }
     const result = store.creditStarsTopUp(ctx.from.id, parsed.amount, payment.total_amount,
       payment.telegram_payment_charge_id);
-    if (result.status === 'credited') return transport.reply(ctx, starsCreditedScreen(result));
+    if (result.status === 'credited') {
+      await transport.reply(ctx, starsCreditedScreen(result));
+      const user = store.findRegisteredUser(String(ctx.from.id));
+      const userName = [user?.firstName, user?.lastName].filter(Boolean).join(' ');
+      const userLabel = `${ctx.from.id}${ctx.from.username ? ` (@${ctx.from.username})` : ''}${userName ? `, ${userName}` : ''}`;
+      const notice = `⭐ Пополнение баланса через Telegram Stars\n` +
+        `Пользователь: ${userLabel}\n` +
+        `Сумма: ${result.amount} ₽ (${result.stars} ⭐)\n` +
+        `Новый баланс: ${result.balance} ₽\n` +
+        `Заявка №${result.topUpId}`;
+      for (const admin of store.listAdmins()) {
+        try { await ctx.telegram.sendMessage(admin.telegramId, notice); }
+        catch { /* админ мог не открыть бота; остальные всё равно получат уведомление */ }
+      }
+      return;
+    }
     if (result.status === 'already_processed') return;
     logger.error('Не удалось зачислить оплату Stars.', { status: result.status, chargeId: payment.telegram_payment_charge_id });
     return ctx.reply('Оплата получена, но зачислить её автоматически не удалось. Напишите администратору.');
