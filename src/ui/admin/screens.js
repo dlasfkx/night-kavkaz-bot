@@ -14,7 +14,6 @@ export function adminMenuScreen(maintenanceMode = false) {
     rows: [
       [
         button('Рассылка', 'admin_broadcast', { icon: 'ellipsis' }),
-        button('Добавить админа', 'admin_add', { icon: 'profile' }),
       ],
       [
         button('Администраторы', 'admin_list', { icon: 'lock' }),
@@ -88,6 +87,14 @@ export function adminUsersScreen({ items, page, pageSize, total, hasPrev, hasNex
   return { parts, rows };
 }
 
+export function adminActionResultScreen(message) {
+  return {
+    parts: [emoji(message.includes('удалён') || message.includes('добавлен') ? 'check' : 'warning'),
+      ' ', message],
+    rows: backRow(),
+  };
+}
+
 export function adminPromptScreen(title, instructions) {
   return {
     parts: [emoji('question'), ' ', bold(title), '\n\n', emoji('bullet'), ' ', instructions],
@@ -95,13 +102,14 @@ export function adminPromptScreen(title, instructions) {
   };
 }
 
-export function adminAdminsScreen(data) {
+export function adminAdminsScreen(data, canManage = false, notice = '') {
   const result = Array.isArray(data)
     ? { items: data.slice(0, 5), page: 0, pageSize: 5, total: data.length, hasPrev: false, hasNext: data.length > 5 }
     : data;
   const { items, page, pageSize, total, hasPrev, hasNext } = result;
   const parts = [emoji('lock'), ' ', bold(`Администраторы (${total})`), '\n',
     emoji('bullet'), ` Страница ${page + 1} из ${Math.max(1, Math.ceil(total / pageSize))}\n\n`];
+  if (notice) parts.push(emoji('check'), ' ', notice, '\n\n');
   if (!items.length) parts.push('Список пуст.');
   else items.forEach((admin, index) => {
     const ordinal = page * pageSize + index + 1;
@@ -126,6 +134,12 @@ export function adminAdminsScreen(data) {
   if (nav.length) rows.push(nav);
   if (Math.max(1, Math.ceil(total / pageSize)) > 1) {
     rows.push([button('Перейти к странице', `admin_admins_goto:${page}`, { icon: 'question' })]);
+  }
+  if (canManage) {
+    rows.push(
+      [button('Добавить администратора', `admin_add:${page}`, { icon: 'profile' })],
+      [button('Удалить администратора', `admin_remove:${page}`, { icon: 'cancel' })],
+    );
   }
   rows.push([button('Обновить', `admin_admins_refresh:${page}`, { icon: 'lightning' })], ...backRow());
   return { parts, rows };

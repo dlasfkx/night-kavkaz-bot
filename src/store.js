@@ -17,7 +17,9 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
     await importLegacyUsers(db, legacyPath);
     seedInitialCatalog(db);
     if (!Array.isArray(bootstrapAdminIds)) throw new TypeError('Некорректный список администраторов.');
-    const seedAdmin = db.prepare('INSERT INTO admins (telegram_id, added_by) VALUES (?, NULL) ON CONFLICT DO NOTHING');
+    const systemAdminIds = new Set(bootstrapAdminIds.map(telegramId));
+    const seedAdmin = db.prepare(`INSERT INTO admins (telegram_id, added_by) VALUES (?, NULL)
+      ON CONFLICT(telegram_id) DO UPDATE SET added_by = NULL`);
     for (const id of bootstrapAdminIds) seedAdmin.run(telegramId(id));
     const getUser = db.prepare(`SELECT telegram_id AS telegramId, accepted_at AS acceptedAt,
       rules_version AS rulesVersion, balance,
@@ -79,6 +81,12 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
     const insertStarsTopUp = db.prepare(`INSERT INTO top_ups
       (telegram_id, method, amount, stars, status, telegram_charge_id) VALUES (?, 'stars', ?, ?, 'approved', ?)`);
     const isAdminQuery = db.prepare('SELECT 1 AS yes FROM admins WHERE telegram_id = ?');
+    const isSystemAdminQuery = db.prepare('SELECT 1 AS yes FROM admins WHERE telegram_id = ? AND added_by IS NULL');
+    const findAdminTargetById = db.prepare('SELECT telegram_id AS telegramId, added_by AS addedBy FROM admins WHERE telegram_id = ?');
+    const findAdminTargetByUsername = db.prepare(`SELECT admins.telegram_id AS telegramId, admins.added_by AS addedBy
+      FROM admins LEFT JOIN users ON users.telegram_id = admins.telegram_id
+      WHERE users.username = ? COLLATE NOCASE LIMIT 1`);
+    const deleteManagedAdmin = db.prepare('DELETE FROM admins WHERE telegram_id = ? AND added_by IS NOT NULL');
     const getMaintenanceModeQuery = db.prepare("SELECT value FROM app_meta WHERE key = 'maintenance_mode'");
     const setMaintenanceModeQuery = db.prepare(`INSERT INTO app_meta (key, value) VALUES ('maintenance_mode', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
@@ -173,6 +181,10 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
       // Кешируется SQL, не результаты: каждый вызов читает текущую базу.
       get(id) { return getUser.get(telegramId(id)); },
       isAdmin(id) { return Boolean(isAdminQuery.get(telegramId(id))); },
+      isSystemAdmin(id) {
+        const adminId = telegramId(id);
+        return systemAdminIds.has(adminId) && Boolean(isSystemAdminQuery.get(adminId));
+      },
       isMaintenanceMode() { return getMaintenanceModeQuery.get()?.value === '1'; },
       setMaintenanceMode(enabled) {
         if (typeof enabled !== 'boolean') throw new TypeError('Режим техработ должен быть включён или выключен.');
@@ -199,7 +211,7 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
         const actor = telegramId(addedBy);
         db.exec('BEGIN IMMEDIATE');
         try {
-          if (!isAdminQuery.get(actor)) {
+          if (!systemAdminIds.has(actor) || !isSystemAdminQuery.get(actor)) {
             db.exec('COMMIT');
             return { status: 'forbidden' };
           }
@@ -212,6 +224,30 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
           const result = insertAdmin.run(target, actor);
           db.exec('COMMIT');
           return { status: result.changes ? 'added' : 'already_admin', telegramId: target, user: registered };
+        } catch (error) {
+          db.exec('ROLLBACK');
+          throw error;
+        }
+      },
+      removeAdmin(userQuery, removedBy) {
+        const query = String(userQuery ?? '').trim();
+        const targetId = /^[1-9]\d{0,19}$/.test(query) ? query : null;
+        const username = query.replace(/^@/, '');
+        const validUsername = !targetId && /^[A-Za-z0-9_]{1,32}$/.test(username);
+        if (!targetId && !validUsername) throw new TypeError('Некорректный Telegram ID или username.');
+        const actor = telegramId(removedBy);
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          if (!systemAdminIds.has(actor) || !isSystemAdminQuery.get(actor)) {
+            db.exec('COMMIT');
+            return { status: 'forbidden' };
+          }
+          const target = targetId ? findAdminTargetById.get(targetId) : findAdminTargetByUsername.get(username);
+          if (!target) { db.exec('COMMIT'); return { status: 'not_admin', query }; }
+          if (target.addedBy == null) { db.exec('COMMIT'); return { status: 'system_admin', telegramId: target.telegramId }; }
+          const result = deleteManagedAdmin.run(target.telegramId);
+          db.exec('COMMIT');
+          return { status: result.changes ? 'removed' : 'not_admin', telegramId: target.telegramId };
         } catch (error) {
           db.exec('ROLLBACK');
           throw error;

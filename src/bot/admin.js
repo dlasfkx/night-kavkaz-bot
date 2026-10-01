@@ -2,7 +2,7 @@ import { answerCallback } from './transport.js';
 import {
   adminMenuScreen, adminPromptScreen, adminAdminsScreen, adminCountScreen,
   adminLookupScreen, adminCreditResultScreen, adminBroadcastPreviewScreen,
-  adminBroadcastResultScreen, adminUsersScreen,
+  adminBroadcastResultScreen, adminUsersScreen, adminActionResultScreen,
 } from '../ui/admin/screens.js';
 import { renderScreen } from '../ui/emoji.js';
 import { emoji } from '../ui/emoji.js';
@@ -88,10 +88,27 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     await startInput(ctx, 'broadcast', 'Новая рассылка',
       'Отправьте текст для зарегистрированных пользователей. Максимум 3500 символов. Перед отправкой будет предпросмотр.');
   });
+  bot.action(/^admin_add:(\d{1,6})$/, async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    if (!store.isSystemAdmin(ctx.from.id)) return answerCallback(ctx, 'Добавлять администраторов могут только владельцы, указанные в ADMIN_IDS.', { show_alert: true });
+    await startInput(ctx, 'add_admin', 'Добавить администратора',
+      'Отправьте Telegram ID или username (с @ или без него). Добавить можно только зарегистрированного пользователя.',
+      { returnPage: Number(ctx.match[1]) });
+  });
+  bot.action(/^admin_remove:(\d{1,6})$/, async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    if (!store.isSystemAdmin(ctx.from.id)) return answerCallback(ctx, 'Удалять администраторов могут только владельцы, указанные в ADMIN_IDS.', { show_alert: true });
+    await startInput(ctx, 'remove_admin', 'Удалить администратора',
+      'Отправьте Telegram ID или username администратора, которого нужно удалить. Владельцев из ADMIN_IDS удалить нельзя.',
+      { returnPage: Number(ctx.match[1]) });
+  });
+  // Старые сообщения с кнопкой из прежней версии остаются безопасными.
   bot.action('admin_add', async ctx => {
     if (!admin(ctx)) return deny(ctx);
+    if (!store.isSystemAdmin(ctx.from.id)) return answerCallback(ctx, 'Добавлять администраторов могут только владельцы, указанные в ADMIN_IDS.', { show_alert: true });
     await startInput(ctx, 'add_admin', 'Добавить администратора',
-      'Отправьте Telegram ID или username (с @ или без него). Добавить можно только зарегистрированного пользователя.');
+      'Отправьте Telegram ID или username (с @ или без него). Добавить можно только зарегистрированного пользователя.',
+      { returnPage: 0 });
   });
   async function showAdmins(ctx, page = 0) {
     ctx.state ??= {};
@@ -99,7 +116,7 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     if (!admin(ctx)) return deny(ctx);
     inputs.delete(String(ctx.from.id));
     await answerCallback(ctx);
-    await transport.show(ctx, adminAdminsScreen(store.listAdminPage(page, 5)));
+    await transport.show(ctx, adminAdminsScreen(store.listAdminPage(page, 5), store.isSystemAdmin(ctx.from.id)));
   }
   bot.action(/^admin_admins_goto:(\d{1,6})$/, async ctx => {
     if (!admin(ctx)) return deny(ctx);
@@ -116,7 +133,7 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     if (!admin(ctx)) return deny(ctx);
     inputs.delete(String(ctx.from.id));
     await answerCallback(ctx, 'Данные обновлены.');
-    await transport.show(ctx, adminAdminsScreen(store.listAdminPage(Number(ctx.match[1]), 5)));
+    await transport.show(ctx, adminAdminsScreen(store.listAdminPage(Number(ctx.match[1]), 5), store.isSystemAdmin(ctx.from.id)));
   });
 
   async function showUsers(ctx, page = 0, buyersOnly = false) {
@@ -276,6 +293,11 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
       return;
     }
     if (state.type === 'add_admin') {
+      if (!store.isSystemAdmin(ctx.from.id)) {
+        inputs.delete(actor);
+        await showInputResult(ctx, state, adminPromptScreen('Недостаточно прав', 'Добавлять администраторов могут только владельцы, указанные в ADMIN_IDS.'));
+        return;
+      }
       if (!validId(text) && !/^@?[A-Za-z0-9_]{1,32}$/.test(text)) {
         await showInputResult(ctx, state, adminPromptScreen('Добавить администратора', 'Формат не распознан. Отправьте Telegram ID или username (с @ или без него).'));
         return;
@@ -301,7 +323,30 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
         : result.status === 'already_admin' ? `Пользователь ${result.telegramId} уже есть в списке администраторов.`
           : result.status === 'not_found' ? `Пользователь ${text} не зарегистрирован в базе данных. Администратор не добавлен.`
             : 'Недостаточно прав. Изменения не внесены.';
-      await showInputResult(ctx, state, { parts: [message], rows: [[{ text: 'Назад', data: 'admin_menu', icon: emoji('back') }]] });
+      await showInputResult(ctx, state, adminActionResultScreen(message));
+      return;
+    }
+    if (state.type === 'remove_admin') {
+      if (!store.isSystemAdmin(ctx.from.id)) {
+        inputs.delete(actor);
+        await showInputResult(ctx, state, adminPromptScreen('Недостаточно прав', 'Удалять администраторов могут только владельцы, указанные в ADMIN_IDS.'));
+        return;
+      }
+      if (!validId(text) && !/^@?[A-Za-z0-9_]{1,32}$/.test(text)) {
+        await showInputResult(ctx, state, adminPromptScreen('Удалить администратора', 'Формат не распознан. Отправьте Telegram ID или username.'));
+        inputs.set(actor, { ...state, createdAt: clock() });
+        return;
+      }
+      const result = store.removeAdmin(text, actor);
+      const messages = {
+        removed: `Администратор ${result.telegramId} удалён.`,
+        not_admin: `Администратор ${text} не найден.`,
+        system_admin: `Нельзя удалить владельца ${result.telegramId}, указанного в ADMIN_IDS.`,
+        forbidden: 'Недостаточно прав. Изменения не внесены.',
+      };
+      inputs.delete(actor);
+      await showInputResult(ctx, state, adminActionResultScreen(
+        messages[result.status] ?? 'Не удалось удалить администратора.'));
       return;
     }
     if (state.type === 'lookup') {
