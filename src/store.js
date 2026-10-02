@@ -24,7 +24,8 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
     const getUser = db.prepare(`SELECT telegram_id AS telegramId, accepted_at AS acceptedAt,
       rules_version AS rulesVersion, balance,
       username, first_name AS firstName, last_name AS lastName, registered_at AS registeredAt,
-      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount
+      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount,
+      users.banned_at AS bannedAt
       FROM users WHERE telegram_id = ?`);
     const accept = db.prepare(`INSERT INTO users (telegram_id, accepted_at, rules_version, registered_at)
       VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -108,31 +109,38 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
     const userLookupQuery = db.prepare(`SELECT telegram_id AS telegramId, accepted_at AS acceptedAt,
       rules_version AS rulesVersion, balance,
       username, first_name AS firstName, last_name AS lastName, registered_at AS registeredAt,
-      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount
+      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount,
+      users.banned_at AS bannedAt
       FROM users WHERE telegram_id = ?`);
     const userByUsernameQuery = db.prepare(`SELECT telegram_id AS telegramId, accepted_at AS acceptedAt,
       rules_version AS rulesVersion, balance, username, first_name AS firstName,
       last_name AS lastName, registered_at AS registeredAt,
-      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount
+      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount,
+      users.banned_at AS bannedAt
       FROM users WHERE username = ? COLLATE NOCASE LIMIT 1`);
     const allUserIdsQuery = db.prepare('SELECT telegram_id AS telegramId FROM users ORDER BY telegram_id');
     const ordinaryUserIdsQuery = db.prepare(`SELECT users.telegram_id AS telegramId FROM users
       WHERE NOT EXISTS (SELECT 1 FROM admins WHERE admins.telegram_id = users.telegram_id)
+        AND users.banned_at IS NULL
       ORDER BY users.telegram_id`);
     const pageUsersQuery = db.prepare(`SELECT telegram_id AS telegramId, username,
       first_name AS firstName, last_name AS lastName, balance,
       registered_at AS registeredAt,
-      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount
+      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount,
+      users.banned_at AS bannedAt
       FROM users ORDER BY registered_at, telegram_id LIMIT ? OFFSET ?`);
-    const buyersCountQuery = db.prepare(`SELECT count(*) AS count FROM users
-      WHERE EXISTS (SELECT 1 FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed')`);
+    // Покупатель: есть хотя бы одна завершённая покупка или положительный баланс.
+    const BUYER_CONDITION = `(users.balance > 0 OR EXISTS (
+        SELECT 1 FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed'
+      ))`;
+    const buyersCountQuery = db.prepare(`SELECT count(*) AS count FROM users WHERE ${BUYER_CONDITION}`);
     const pageBuyersQuery = db.prepare(`SELECT telegram_id AS telegramId, username,
       first_name AS firstName, last_name AS lastName, balance,
       registered_at AS registeredAt,
-      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount
-      FROM users WHERE EXISTS (
-        SELECT 1 FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed'
-      ) ORDER BY registered_at, telegram_id LIMIT ? OFFSET ?`);
+      (SELECT count(*) FROM purchases WHERE purchases.telegram_id = users.telegram_id AND purchases.status = 'completed') AS purchaseCount,
+      users.banned_at AS bannedAt
+      FROM users WHERE ${BUYER_CONDITION}
+      ORDER BY registered_at, telegram_id LIMIT ? OFFSET ?`);
     const updateProfileQuery = db.prepare(`INSERT INTO users
       (telegram_id, username, first_name, last_name, registered_at)
       VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -143,6 +151,23 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
     const balanceAfterQuery = db.prepare('SELECT balance FROM users WHERE telegram_id = ?');
     const insertCreditAudit = db.prepare(`INSERT INTO admin_balance_transactions
       (telegram_id, admin_id, amount, balance_after) VALUES (?, ?, ?, ?)`);
+    const isBannedQuery = db.prepare('SELECT 1 AS yes FROM users WHERE telegram_id = ? AND banned_at IS NOT NULL');
+    const banUserQuery = db.prepare(`UPDATE users SET banned_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), banned_by = ?
+      WHERE telegram_id = ? AND banned_at IS NULL`);
+    const unbanUserQuery = db.prepare(`UPDATE users SET banned_at = NULL, banned_by = NULL
+      WHERE telegram_id = ? AND banned_at IS NOT NULL`);
+    const pendingCardTopUpIdsOfUser = db.prepare(`SELECT id FROM top_ups
+      WHERE telegram_id = ? AND method = 'card' AND status = 'pending' ORDER BY id`);
+    const latestPendingCardTopUp = db.prepare(`SELECT id FROM top_ups
+      WHERE telegram_id = ? AND method = 'card' AND status = 'pending' ORDER BY id LIMIT 1`);
+    const pendingReceiptsCountQuery = db.prepare(`SELECT count(*) AS count FROM top_ups
+      WHERE method = 'card' AND status = 'pending'`);
+    const pagePendingReceiptsQuery = db.prepare(`SELECT top_ups.id, top_ups.telegram_id AS telegramId,
+      top_ups.amount, top_ups.created_at AS createdAt, top_ups.receipt_kind AS receiptKind,
+      users.username, users.first_name AS firstName, users.last_name AS lastName
+      FROM top_ups LEFT JOIN users ON users.telegram_id = top_ups.telegram_id
+      WHERE top_ups.method = 'card' AND top_ups.status = 'pending'
+      ORDER BY top_ups.created_at, top_ups.id LIMIT ? OFFSET ?`);
     const MAX_BALANCE = 9007199254740991;
     const purchaseIdOf = value => {
       if (!Number.isSafeInteger(value) || value < 1) throw new TypeError('Некорректный номер покупки.');
@@ -298,6 +323,64 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
           return { status: 'credited', telegramId: target, amount, balance };
         } catch (error) { db.exec('ROLLBACK'); throw error; }
       },
+      isBanned(id) { return Boolean(isBannedQuery.get(telegramId(id))); },
+      // Блокировка: пользователь теряет доступ к боту, его чеки на проверке отклоняются.
+      banUser(adminId, userQuery) {
+        const actor = telegramId(adminId);
+        const query = String(userQuery ?? '').trim();
+        const idQuery = /^[1-9]\d{0,19}$/.test(query) ? query : null;
+        const username = query.replace(/^@/, '');
+        if (!idQuery && !/^[A-Za-z0-9_]{1,32}$/.test(username)) throw new TypeError('Некорректный Telegram ID или username.');
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          if (!isAdminQuery.get(actor)) { db.exec('COMMIT'); return { status: 'forbidden' }; }
+          const registered = idQuery ? userLookupQuery.get(idQuery) : userByUsernameQuery.get(username);
+          if (!registered) { db.exec('COMMIT'); return { status: 'not_found', query }; }
+          const target = registered.telegramId;
+          if (target === actor) { db.exec('COMMIT'); return { status: 'self', telegramId: target, user: registered }; }
+          if (isAdminQuery.get(target)) { db.exec('COMMIT'); return { status: 'is_admin', telegramId: target, user: registered }; }
+          if (registered.bannedAt) { db.exec('COMMIT'); return { status: 'already_banned', telegramId: target, user: registered }; }
+          banUserQuery.run(actor, target);
+          const rejectedIds = pendingCardTopUpIdsOfUser.all(target).map(row => row.id);
+          for (const topUpId of rejectedIds) reviewTopUpQuery.run('rejected', actor, topUpId);
+          db.exec('COMMIT');
+          return { status: 'banned', telegramId: target, user: registered,
+            rejectedTopUps: rejectedIds.map(topUpId => getTopUpQuery.get(topUpId)) };
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+      },
+      unbanUser(adminId, userQuery) {
+        const actor = telegramId(adminId);
+        const query = String(userQuery ?? '').trim();
+        const idQuery = /^[1-9]\d{0,19}$/.test(query) ? query : null;
+        const username = query.replace(/^@/, '');
+        if (!idQuery && !/^[A-Za-z0-9_]{1,32}$/.test(username)) throw new TypeError('Некорректный Telegram ID или username.');
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          if (!isAdminQuery.get(actor)) { db.exec('COMMIT'); return { status: 'forbidden' }; }
+          const registered = idQuery ? userLookupQuery.get(idQuery) : userByUsernameQuery.get(username);
+          if (!registered) { db.exec('COMMIT'); return { status: 'not_found', query }; }
+          const result = unbanUserQuery.run(registered.telegramId);
+          db.exec('COMMIT');
+          return { status: result.changes ? 'unbanned' : 'not_banned', telegramId: registered.telegramId, user: registered };
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+      },
+      pendingCardTopUp(id) {
+        const row = latestPendingCardTopUp.get(telegramId(id));
+        return row ? getTopUpQuery.get(row.id) : undefined;
+      },
+      pendingReceiptCount() { return pendingReceiptsCountQuery.get().count; },
+      listPendingReceipts(page = 0, pageSize = 5) {
+        if (!Number.isSafeInteger(page) || page < 0 || !Number.isSafeInteger(pageSize) ||
+            pageSize < 1 || pageSize > 10 || !Number.isSafeInteger(page * pageSize)) {
+          throw new TypeError('Некорректная страница чеков.');
+        }
+        const total = pendingReceiptsCountQuery.get().count;
+        const lastPage = Math.max(0, Math.ceil(total / pageSize) - 1);
+        const safePage = Math.min(page, lastPage);
+        const rows = pagePendingReceiptsQuery.all(pageSize + 1, safePage * pageSize);
+        return { items: rows.slice(0, pageSize), hasPrev: safePage > 0,
+          hasNext: rows.length > pageSize, page: safePage, pageSize, total };
+      },
       accept(id, rulesVersion = 1) {
         if (!Number.isSafeInteger(rulesVersion) || rulesVersion < 1) throw new TypeError('Некорректная версия правил.');
         accept.run(telegramId(id), new Date().toISOString(), rulesVersion);
@@ -388,7 +471,7 @@ export async function createStore(file, { legacyPath, bootstrapAdminIds = [] } =
         return completePurchaseQuery.run(inviteLink, purchaseIdOf(purchaseId)).changes === 1;
       },
       revertPurchase,
-      createCardTopUp(id, amount, receiptFileId, receiptKind, maxPending = 3) {
+      createCardTopUp(id, amount, receiptFileId, receiptKind, maxPending = 1) {
         const user = telegramId(id);
         if (!Number.isSafeInteger(amount) || amount < 1) throw new TypeError('Некорректная сумма пополнения.');
         if (typeof receiptFileId !== 'string' || !receiptFileId || receiptFileId.length > 512) {

@@ -109,6 +109,11 @@ const migrations = [{ version: 1, sql: `
     message_id INTEGER NOT NULL,
     PRIMARY KEY (top_up_id, chat_id, message_id)
   );
+` }, { version: 10, sql: `
+  -- Блокировка пользователей администраторами.
+  ALTER TABLE users ADD COLUMN banned_at TEXT;
+  ALTER TABLE users ADD COLUMN banned_by TEXT;
+  CREATE INDEX top_ups_pending ON top_ups(method, status, created_at, id);
 ` }];
 export function migrateSchema(db) {
   db.exec('BEGIN IMMEDIATE');

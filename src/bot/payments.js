@@ -8,7 +8,8 @@ import {
 import { topUpAdminCaption, topUpAdminKeyboard } from '../ui/admin/screens.js';
 
 const RECEIPT_TTL_MS = 30 * 60 * 1000;
-const MAX_PENDING_CARD_TOP_UPS = 3;
+// Пока один чек на проверке, отправить следующий нельзя.
+const MAX_PENDING_CARD_TOP_UPS = 1;
 const STARS_PAYLOAD = /^stars:(\d{1,9}):([1-9]\d{0,19})$/;
 
 // Пополнение баланса: банковская карта (проверка чека админом) и Telegram Stars.
@@ -26,6 +27,15 @@ export function registerPaymentHandlers(bot, { store, transport, rulesVersion, m
     await transport.show(ctx, welcomeScreen());
     return null;
   }
+  // Если чек уже на проверке, новое пополнение картой не начинаем.
+  async function blockIfPending(ctx) {
+    const pending = store.pendingCardTopUp(ctx.from.id);
+    if (!pending) return false;
+    waitingReceipt.delete(String(ctx.from.id));
+    await answerCallback(ctx, 'Дождитесь проверки первого чека.', { show_alert: true });
+    await transport.show(ctx, receiptTooManyScreen(pending));
+    return true;
+  }
   function amountFrom(ctx) {
     const amount = Number(ctx.match[1]);
     return isTopUpAmount(amount) ? amount : null;
@@ -36,6 +46,7 @@ export function registerPaymentHandlers(bot, { store, transport, rulesVersion, m
     if (!(await requireAgreement(ctx))) return;
     const amount = amountFrom(ctx);
     if (!amount) return answerCallback(ctx, 'Эта сумма недоступна. Выберите сумму из списка.');
+    if (await blockIfPending(ctx)) return;
     waitingReceipt.delete(String(ctx.from.id));
     await answerCallback(ctx);
     await transport.show(ctx, cardTopUpScreen(amount, moneyAcceptCard));
@@ -44,6 +55,7 @@ export function registerPaymentHandlers(bot, { store, transport, rulesVersion, m
     if (!(await requireAgreement(ctx))) return;
     const amount = amountFrom(ctx);
     if (!amount || !moneyAcceptCard) return answerCallback(ctx, 'Оплата картой сейчас недоступна.', { show_alert: true });
+    if (await blockIfPending(ctx)) return;
     waitingReceipt.set(String(ctx.from.id), { amount, createdAt: clock() });
     await answerCallback(ctx);
     await transport.show(ctx, receiptPromptScreen(amount));
@@ -92,7 +104,7 @@ export function registerPaymentHandlers(bot, { store, transport, rulesVersion, m
     const kind = photo ? 'photo' : 'document';
     const result = store.createCardTopUp(userId, state.amount, fileId, kind, MAX_PENDING_CARD_TOP_UPS);
     waitingReceipt.delete(userId);
-    if (result.status === 'too_many') return transport.reply(ctx, receiptTooManyScreen());
+    if (result.status === 'too_many') return transport.reply(ctx, receiptTooManyScreen(store.pendingCardTopUp(userId)));
     if (result.status !== 'created') return transport.reply(ctx, receiptExpiredScreen());
     await sendReceiptToAdmins(ctx, result.topUp);
     await transport.reply(ctx, receiptSentScreen(result.topUp));

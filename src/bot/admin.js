@@ -3,7 +3,9 @@ import {
   adminMenuScreen, adminPromptScreen, adminAdminsScreen, adminCountScreen,
   adminLookupScreen, adminCreditResultScreen, adminBroadcastPreviewScreen,
   adminBroadcastResultScreen, adminUsersScreen, adminActionResultScreen,
+  adminBanResultScreen, adminReceiptsScreen, topUpAdminCaption, topUpAdminKeyboard,
 } from '../ui/admin/screens.js';
+import { bannedScreen } from '../ui/screens.js';
 import { renderScreen } from '../ui/emoji.js';
 import { emoji } from '../ui/emoji.js';
 
@@ -11,6 +13,10 @@ const INPUT_TTL_MS = 10 * 60 * 1000;
 const MAX_BROADCAST_LENGTH = 3500;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const validId = value => /^[1-9]\d{0,19}$/.test(value);
+const validUserQuery = value => validId(value) || /^@?[A-Za-z0-9_]{1,32}$/.test(value);
+// Ввод из вкладки «Пользователи»: отмена возвращает в неё, а не в главное меню панели.
+const USER_TOOL_INPUTS = new Set(['lookup', 'credit', 'ban', 'unban']);
+const USERS_CANCEL = 'admin_users_cancel';
 
 export function registerAdminHandlers(bot, { store, transport, clock = Date.now, logger = console }) {
   const inputs = new Map();
@@ -21,7 +27,7 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     await answerCallback(ctx, 'Доступ только для администраторов.', { show_alert: true });
   }
   async function showMenu(ctx) {
-    await transport.show(ctx, adminMenuScreen(store.isMaintenanceMode()));
+    await transport.show(ctx, adminMenuScreen(store.isMaintenanceMode(), store.pendingReceiptCount()));
   }
   async function removeIncomingMessage(ctx) {
     try { await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id); }
@@ -57,7 +63,7 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     const state = { type, createdAt: clock(), prompt, ...extraState };
     inputs.set(String(ctx.from.id), state);
     await answerCallback(ctx);
-    await transport.show(ctx, adminPromptScreen(title, instructions));
+    await transport.show(ctx, adminPromptScreen(title, instructions, state.cancelData));
   }
   async function showInputResult(ctx, state, screen) {
     await replacePrompt(ctx, state, screen);
@@ -174,15 +180,66 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     await answerCallback(ctx, 'Данные обновлены.');
     await transport.show(ctx, adminUsersScreen(store.listBuyers(Number(ctx.match[1]), 5), true));
   });
+  bot.action(USERS_CANCEL, ctx => showUsers(ctx));
   bot.action('admin_lookup', async ctx => {
     if (!admin(ctx)) return deny(ctx);
     await startInput(ctx, 'lookup', 'Проверить пользователя',
-      'Отправьте Telegram ID или username (с @ или без него).');
+      'Отправьте Telegram ID или username (с @ или без него).', { cancelData: USERS_CANCEL });
   });
   bot.action('admin_credit', async ctx => {
     if (!admin(ctx)) return deny(ctx);
     await startInput(ctx, 'credit', 'Выдать баланс',
-      'Отправьте Telegram ID или username и сумму в рублях через пробел, например: @username 500 или 123456789 500. Начисление доступно только зарегистрированным пользователям.');
+      'Отправьте Telegram ID или username и сумму в рублях через пробел, например: @username 500 или 123456789 500. Начисление доступно только зарегистрированным пользователям.',
+      { cancelData: USERS_CANCEL });
+  });
+  bot.action('admin_ban', async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    await startInput(ctx, 'ban', 'Забанить пользователя',
+      'Отправьте Telegram ID или username (с @ или без него). Пользователь потеряет доступ к боту, а его чеки на проверке будут отклонены. Заблокировать можно только зарегистрированного пользователя.',
+      { cancelData: USERS_CANCEL });
+  });
+  bot.action('admin_unban', async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    await startInput(ctx, 'unban', 'Разбанить пользователя',
+      'Отправьте Telegram ID или username (с @ или без него) заблокированного пользователя.',
+      { cancelData: USERS_CANCEL });
+  });
+
+  // ---------- Непроверенные чеки ----------
+  async function showReceipts(ctx, page = 0, notice) {
+    if (!admin(ctx)) return deny(ctx);
+    inputs.delete(String(ctx.from.id));
+    if (notice !== undefined) await answerCallback(ctx, notice);
+    else await answerCallback(ctx);
+    await transport.show(ctx, adminReceiptsScreen(store.listPendingReceipts(page, 5)));
+  }
+  bot.action('admin_receipts', ctx => showReceipts(ctx));
+  bot.action(/^admin_receipts:(\d{1,6})$/, ctx => showReceipts(ctx, Number(ctx.match[1])));
+  bot.action(/^admin_receipts_refresh:(\d{1,6})$/, ctx => showReceipts(ctx, Number(ctx.match[1]), 'Данные обновлены.'));
+  bot.action(/^admin_receipt:(\d{1,15}):(\d{1,6})$/, async ctx => {
+    if (!admin(ctx)) return deny(ctx);
+    const topUp = store.getTopUp(Number(ctx.match[1]));
+    const page = Number(ctx.match[2]);
+    if (!topUp || topUp.method !== 'card' || topUp.status !== 'pending') {
+      await answerCallback(ctx, 'Этот чек уже проверен. Список обновлён.', { show_alert: true });
+      await transport.show(ctx, adminReceiptsScreen(store.listPendingReceipts(page, 5)));
+      return;
+    }
+    const extra = {
+      caption: topUpAdminCaption(topUp, store.findRegisteredUser(String(topUp.telegramId))),
+      reply_markup: topUpAdminKeyboard(topUp.id),
+    };
+    try {
+      const message = topUp.receiptKind === 'photo'
+        ? await ctx.telegram.sendPhoto(ctx.chat.id, topUp.receiptFileId, extra)
+        : await ctx.telegram.sendDocument(ctx.chat.id, topUp.receiptFileId, extra);
+      // Сообщение попадёт в общий список: после решения подпись обновится у всех админов.
+      store.addTopUpAdminMessage(topUp.id, ctx.chat.id, message.message_id);
+      await answerCallback(ctx, `Чек №${topUp.id} отправлен ниже.`);
+    } catch (error) {
+      logger.warn('Не удалось открыть чек.', { topUpId: topUp.id, code: error.response?.error_code ?? error.code });
+      await answerCallback(ctx, 'Не удалось открыть чек. Попробуйте ещё раз.', { show_alert: true });
+    }
   });
   bot.action('admin_broadcast_cancel', async ctx => {
     if (!admin(ctx)) return deny(ctx);
@@ -249,7 +306,8 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
         return await showInputResult(ctx, state, adminUsersScreen(data, Boolean(state.buyersOnly)));
       }
       if (state.type === 'page_admins') return await showInputResult(ctx, state, adminAdminsScreen(store.listAdminPage(state.returnPage ?? 0, 5)));
-      await showInputResult(ctx, state, adminMenuScreen(store.isMaintenanceMode()));
+      if (USER_TOOL_INPUTS.has(state.type)) return await showInputResult(ctx, state, adminUsersScreen(store.listUsers(0, 5), false));
+      await showInputResult(ctx, state, adminMenuScreen(store.isMaintenanceMode(), store.pendingReceiptCount()));
       return;
     }
     if (state.type === 'page_users' || state.type === 'page_buyers' || state.type === 'page_admins') {
@@ -349,10 +407,49 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
         messages[result.status] ?? 'Не удалось удалить администратора.'));
       return;
     }
+    if (state.type === 'ban' || state.type === 'unban') {
+      const banning = state.type === 'ban';
+      if (!validUserQuery(text)) {
+        await showInputResult(ctx, state, adminPromptScreen(banning ? 'Забанить пользователя' : 'Разбанить пользователя',
+          'Формат не распознан. Отправьте Telegram ID или username (с @ или без него) или /cancel.', USERS_CANCEL));
+        inputs.set(actor, { ...state, createdAt: clock() });
+        return;
+      }
+      inputs.delete(actor);
+      const result = banning ? store.banUser(actor, text) : store.unbanUser(actor, text);
+      await showInputResult(ctx, state, adminBanResultScreen(result, text));
+      if (result.status !== 'banned' && result.status !== 'unbanned') return;
+      if (banning) {
+        // Отклонённые при блокировке чеки: убираем кнопки у всех админов.
+        const banned = store.findRegisteredUser(result.telegramId);
+        const reviewer = store.findRegisteredUser(actor);
+        for (const topUp of result.rejectedTopUps ?? []) {
+          const caption = topUpAdminCaption(topUp, banned, reviewer);
+          for (const { chatId, messageId } of store.listTopUpAdminMessages(topUp.id)) {
+            try { await ctx.telegram.editMessageCaption(chatId, messageId, undefined, caption, { reply_markup: { inline_keyboard: [] } }); }
+            catch { /* сообщение могли удалить */ }
+          }
+        }
+        try { await transport.send(ctx.telegram, result.telegramId, bannedScreen()); }
+        catch { /* пользователь мог заблокировать бота */ }
+      }
+      const actorInfo = store.findRegisteredUser(actor);
+      const target = result.user;
+      const targetLabel = `${result.telegramId}${target?.username ? ` (@${target.username})` : ''}`;
+      const notice = `Админ ${actor}${actorInfo?.username ? ` (@${actorInfo.username})` : ''} ` +
+        `${banning ? 'заблокировал' : 'разблокировал'} пользователя ${targetLabel}.`;
+      for (const other of store.listAdmins()) {
+        if (String(other.telegramId) === actor) continue;
+        try { await ctx.telegram.sendMessage(other.telegramId, notice); }
+        catch { /* админ мог не открыть бота */ }
+        await sleep(40);
+      }
+      return;
+    }
     if (state.type === 'lookup') {
       const validLookup = validId(text) || /^@?[A-Za-z0-9_]{1,32}$/.test(text);
       if (!validLookup) {
-        await showInputResult(ctx, state, adminPromptScreen('Проверить пользователя', 'Формат не распознан. Отправьте Telegram ID или username (с @ или без него).'));
+        await showInputResult(ctx, state, adminPromptScreen('Проверить пользователя', 'Формат не распознан. Отправьте Telegram ID или username (с @ или без него).', USERS_CANCEL));
         return;
       }
       inputs.delete(actor);
@@ -362,12 +459,12 @@ export function registerAdminHandlers(bot, { store, transport, clock = Date.now,
     if (state.type === 'credit') {
       const match = text.match(/^(@?[A-Za-z0-9_]{1,32}|[1-9]\d{0,19})\s+([1-9]\d{0,11})$/);
       if (!match) {
-        await showInputResult(ctx, state, adminPromptScreen('Выдать баланс', 'Формат: ID или @username и целая сумма в рублях через пробел, например @username 500 или 123456789 500.'));
+        await showInputResult(ctx, state, adminPromptScreen('Выдать баланс', 'Формат: ID или @username и целая сумма в рублях через пробел, например @username 500 или 123456789 500.', USERS_CANCEL));
         return;
       }
       const amount = Number(match[2]);
       if (!Number.isSafeInteger(amount) || amount < 1) {
-        await showInputResult(ctx, state, adminPromptScreen('Выдать баланс', 'Сумма вне допустимого диапазона. Введите меньшую сумму или /cancel.'));
+        await showInputResult(ctx, state, adminPromptScreen('Выдать баланс', 'Сумма вне допустимого диапазона. Введите меньшую сумму или /cancel.', USERS_CANCEL));
         return;
       }
       inputs.delete(actor);

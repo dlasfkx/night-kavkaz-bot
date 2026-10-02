@@ -1,8 +1,10 @@
 import { button, bold, emoji } from '../emoji.js';
 
 const backRow = () => [[button('Назад', 'admin_menu', { icon: 'back' })]];
+// Экраны из вкладки «Пользователи» возвращают обратно в неё.
+const usersBackRow = () => [[button('Назад', 'admin_users', { icon: 'back' })]];
 
-export function adminMenuScreen(maintenanceMode = false) {
+export function adminMenuScreen(maintenanceMode = false, pendingReceipts = 0) {
   return {
     parts: [
       emoji('lock'), ' ', bold('Панель администратора'),
@@ -14,14 +16,11 @@ export function adminMenuScreen(maintenanceMode = false) {
     rows: [
       [
         button('Рассылка', 'admin_broadcast', { icon: 'ellipsis' }),
+        button(pendingReceipts > 0 ? `Чеки (${pendingReceipts})` : 'Чеки', 'admin_receipts', { icon: 'card' }),
       ],
       [
         button('Администраторы', 'admin_list', { icon: 'lock' }),
         button('Пользователи', 'admin_users', { icon: 'eyes' }),
-      ],
-      [
-        button('Проверить пользователя', 'admin_lookup', { icon: 'question' }),
-        button('Выдать баланс', 'admin_credit', { icon: 'diamond' }),
       ],
       [button(maintenanceMode ? 'Выключить техработы' : 'Включить техработы', 'admin_maintenance_toggle',
         { icon: maintenanceMode ? 'check' : 'warning', style: maintenanceMode ? 'success' : 'danger' })],
@@ -50,7 +49,7 @@ export function adminUsersScreen({ items, page, pageSize, total, hasPrev, hasNex
     emoji('bullet'), ` Страница ${page + 1} из ${pageCount}\n\n`,
   ];
   if (!items.length) {
-    parts.push(buyersOnly ? 'Пока нет пользователей с покупками.' : 'Пока нет зарегистрированных пользователей.');
+    parts.push(buyersOnly ? 'Пока нет пользователей с покупками или положительным балансом.' : 'Пока нет зарегистрированных пользователей.');
   } else {
     items.forEach((user, index) => {
       const ordinal = page * pageSize + index + 1;
@@ -64,6 +63,7 @@ export function adminUsersScreen({ items, page, pageSize, total, hasPrev, hasNex
         emoji('question'), ` Покупок: ${user.purchaseCount}\n`,
         emoji('question'), ` Регистрация: ${displayDate(user.registeredAt)}\n`,
       );
+      if (user.bannedAt) parts.push(emoji('lock'), ' ', bold('Заблокирован'), '\n');
       if (index < items.length - 1) parts.push('\n────────────\n\n');
     });
   }
@@ -81,6 +81,16 @@ export function adminUsersScreen({ items, page, pageSize, total, hasPrev, hasNex
       buyersOnly ? 'admin_users:0' : 'admin_buyers:0', { icon: buyersOnly ? 'eyes' : 'cart' }),
   ]);
   rows.push(
+    [
+      button('Проверить пользователя', 'admin_lookup', { icon: 'question' }),
+      button('Выдать баланс', 'admin_credit', { icon: 'diamond' }),
+    ],
+    [
+      button('Забанить', 'admin_ban', { icon: 'cancel', style: 'danger' }),
+      button('Разбанить', 'admin_unban', { icon: 'check' }),
+    ],
+  );
+  rows.push(
     [button('Обновить', `${buyersOnly ? 'admin_buyers' : 'admin_users'}_refresh:${page}`, { icon: 'lightning' })],
     [button('Назад', 'admin_menu', { icon: 'back' })],
   );
@@ -95,10 +105,10 @@ export function adminActionResultScreen(message) {
   };
 }
 
-export function adminPromptScreen(title, instructions) {
+export function adminPromptScreen(title, instructions, cancelData = 'admin_cancel') {
   return {
     parts: [emoji('question'), ' ', bold(title), '\n\n', emoji('bullet'), ' ', instructions],
-    rows: [[button('Отмена', 'admin_cancel', { icon: 'cancel' })]],
+    rows: [[button('Отмена', cancelData, { icon: 'cancel' })]],
   };
 }
 
@@ -161,8 +171,11 @@ export function adminLookupScreen(user, query) {
     parts.push(emoji('question'), ` Баланс: ${adminMoney(user.balance)}\n`);
     parts.push(emoji('question'), ` Покупок: ${user.purchaseCount}\n`);
     parts.push(emoji('question'), ` Регистрация: ${displayDate(user.registeredAt)}\n`);
+    parts.push(...(user.bannedAt
+      ? [emoji('lock'), ' Статус: ', bold('заблокирован'), ` с ${displayDate(user.bannedAt)}\n`]
+      : [emoji('check'), ' Статус: активен\n']));
   }
-  return { parts, rows: backRow() };
+  return { parts, rows: usersBackRow() };
 }
 
 export function adminCreditResultScreen(result) {
@@ -178,7 +191,70 @@ export function adminCreditResultScreen(result) {
       emoji('bullet'), ` Новый баланс: ${adminMoney(result.balance)}\n`,
       'Операция сохранена в журнале.']
     : [emoji('warning'), ' ', messages[result.status] ?? 'Не удалось пополнить баланс.'];
-  return { parts, rows: backRow() };
+  return { parts, rows: usersBackRow() };
+}
+
+export function adminBanResultScreen(result, query) {
+  const target = result.telegramId ?? query;
+  const label = userLabel(target, result.user);
+  if (result.status === 'banned') {
+    const rejected = result.rejectedTopUps?.length ?? 0;
+    return {
+      parts: [emoji('lock'), ' ', bold('Пользователь заблокирован.'), '\n\n',
+        emoji('bullet'), ` Пользователь: ${label}\n`,
+        emoji('bullet'), ' Доступ к боту закрыт, рассылки ему не приходят.',
+        ...(rejected ? ['\n', emoji('bullet'), ` Отклонено чеков на проверке: ${rejected}`] : [])],
+      rows: usersBackRow(),
+    };
+  }
+  if (result.status === 'unbanned') {
+    return {
+      parts: [emoji('check'), ' ', bold('Пользователь разблокирован.'), '\n\n',
+        emoji('bullet'), ` Пользователь: ${label}\n`,
+        emoji('bullet'), ' Доступ к боту снова открыт.'],
+      rows: usersBackRow(),
+    };
+  }
+  const messages = {
+    not_found: `Пользователь ${query} не зарегистрирован в базе данных. Изменения не внесены.`,
+    already_banned: `Пользователь ${label} уже заблокирован.`,
+    not_banned: `Пользователь ${label} не заблокирован.`,
+    is_admin: `Нельзя заблокировать администратора ${label}. Сначала удалите его из администраторов.`,
+    self: 'Нельзя заблокировать самого себя.',
+    forbidden: 'Недостаточно прав. Изменения не внесены.',
+  };
+  return { parts: [emoji('warning'), ' ', messages[result.status] ?? 'Не удалось выполнить операцию.'], rows: usersBackRow() };
+}
+
+export function adminReceiptsScreen({ items, page, pageSize, total, hasPrev, hasNext }, notice = '') {
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const parts = [
+    emoji('card'), ' ', bold('Непроверенные чеки'), '\n',
+    emoji('bullet'), ` Всего: ${total}\n`,
+    emoji('bullet'), ` Страница ${page + 1} из ${pageCount}\n\n`,
+  ];
+  if (notice) parts.push(emoji('check'), ' ', notice, '\n\n');
+  if (!items.length) parts.push(emoji('check'), ' Все чеки проверены. Новых заявок нет.');
+  else {
+    items.forEach((item, index) => {
+      parts.push(
+        emoji('star'), ' ', bold(`Заявка №${item.id}`), '\n',
+        emoji('diamond'), ` Сумма: ${adminMoney(item.amount)}\n`,
+        emoji('question'), ` Пользователь: ${userLabel(item.telegramId, item)}\n`,
+        emoji('hourglass'), ` Создана: ${displayDate(item.createdAt)}\n`,
+      );
+      if (index < items.length - 1) parts.push('\n────────────\n\n');
+    });
+    parts.push('\n', emoji('bullet'), ' Нажмите на заявку, чтобы открыть чек с кнопками «Зачислить» и «Отклонить».');
+  }
+  const rows = items.map(item => [button(`Открыть чек №${item.id} · ${adminMoney(item.amount)}`,
+    `admin_receipt:${item.id}:${page}`, { icon: 'eyes' })]);
+  const navigation = [];
+  if (hasPrev) navigation.push(button('← Назад', `admin_receipts:${page - 1}`, { icon: 'back' }));
+  if (hasNext) navigation.push(button('Далее →', `admin_receipts:${page + 1}`));
+  if (navigation.length) rows.push(navigation);
+  rows.push([button('Обновить', `admin_receipts_refresh:${page}`, { icon: 'lightning' })], ...backRow());
+  return { parts, rows };
 }
 
 export function adminBroadcastPreviewScreen(message, recipientCount) {
@@ -213,6 +289,7 @@ export function topUpAdminCaption(topUp, user, reviewer) {
     `Пользователь: ${userLabel(topUp.telegramId, user)}`,
     `Создана: ${displayDate(topUp.createdAt)}`,
   ];
+  if (user?.bannedAt) lines.push('🔒 Пользователь заблокирован');
   if (topUp.status === 'approved') lines.push('', `✅ Зачислено. Админ: ${userLabel(topUp.reviewedBy, reviewer)}`);
   else if (topUp.status === 'rejected') lines.push('', `❌ Отклонено. Админ: ${userLabel(topUp.reviewedBy, reviewer)}`);
   else lines.push('', 'Проверьте поступление денег и примите решение.');

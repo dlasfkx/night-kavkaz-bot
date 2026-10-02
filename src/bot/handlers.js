@@ -1,5 +1,5 @@
 import {
-  welcomeScreen, maintenanceScreen, menuScreen, profileScreen, productsScreen, errorScreen,
+  welcomeScreen, maintenanceScreen, bannedScreen, menuScreen, profileScreen, productsScreen, errorScreen,
   topUpScreen, topUpMethodScreen, purchasesScreen, purchaseConfirmScreen,
   purchaseCompleteScreen, insufficientFundsText, changedPriceText, purchaseFailedText,
 } from '../ui/screens.js';
@@ -23,6 +23,9 @@ export function registerHandlers(bot, { store, transport, rulesVersion, channels
       if (store.isMaintenanceMode() && !store.isAdmin(ctx.from?.id)) {
         return ctx.answerPreCheckoutQuery(false, 'Бот временно на технических работах. Попробуйте позже.');
       }
+      if (ctx.from && store.isBanned(ctx.from.id) && !store.isAdmin(ctx.from.id)) {
+        return ctx.answerPreCheckoutQuery(false, 'Ваш аккаунт заблокирован.');
+      }
       return next();
     }
     if (ctx.message?.successful_payment) return next();
@@ -40,6 +43,16 @@ export function registerHandlers(bot, { store, transport, rulesVersion, channels
         await transport.show(ctx, maintenanceScreen());
       } else if (message) {
         await transport.reply(ctx, maintenanceScreen());
+      }
+      return;
+    }
+    // Заблокированный пользователь не может пользоваться ботом (администраторов блокировать нельзя).
+    if (store.isBanned(ctx.from.id) && !store.isAdmin(ctx.from.id)) {
+      if (ctx.callbackQuery) {
+        await answerCallback(ctx, 'Ваш аккаунт заблокирован.', { show_alert: true });
+        await transport.show(ctx, bannedScreen());
+      } else if (ctx.message) {
+        await transport.reply(ctx, bannedScreen());
       }
       return;
     }

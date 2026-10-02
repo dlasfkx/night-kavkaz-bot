@@ -16,6 +16,14 @@ export function maintenanceScreen() {
   };
 }
 
+export function bannedScreen() {
+  return {
+    parts: [emoji('lock'), ' ', bold('Ваш аккаунт заблокирован.'),
+      '\n\n', emoji('bullet'), ' Доступ к боту закрыт администрацией.',
+      '\n', emoji('bullet'), ' Если вы считаете, что это ошибка, свяжитесь с администратором.'],
+  };
+}
+
 export function welcomeScreen() {
   return { parts: [
     emoji('folder'), ' ', bold('Приветствуем! Перед началом работы, пожалуйста, ознакомьтесь с основными правилами.'), '\n\n',
@@ -107,7 +115,10 @@ export function receiptPromptScreen(amount) {
   return {
     parts: [emoji('card'), ' ', bold('Отправьте чек'), '\n\n',
       emoji('bullet'), ` Сумма: ${money(amount)}\n\n`,
-      'Пришлите чек одним сообщением: фото, скриншот или документ.'],
+      'Пришлите чек одним сообщением: фото, скриншот или документ.\n\n',
+      emoji('warning'), ' ', bold('Внимание!'), ' Отправляйте только чек нового перевода. ',
+      'Если вы повторно пришлёте чек, по которому баланс уже был начислен, ',
+      bold('ваш аккаунт будет заблокирован.')],
     rows: [[button('Отмена', 'top_up_receipt_cancel', { icon: 'cancel' })]],
   };
 }
@@ -129,9 +140,12 @@ export function receiptSentScreen(topUp) {
     rows: back('profile'),
   };
 }
-export function receiptTooManyScreen() {
+export function receiptTooManyScreen(topUp) {
   return {
-    parts: [emoji('warning'), ' У вас уже есть заявки на проверке. Дождитесь решения по ним, прежде чем отправлять новую.'],
+    parts: [emoji('hourglass'), ' ', bold('Дождитесь проверки первого чека'), '\n\n',
+      ...(topUp ? [emoji('bullet'), ` Заявка №${topUp.id}\n`, emoji('bullet'), ` Сумма: ${money(topUp.amount)}\n\n`] : []),
+      'Ваш чек уже на проверке у администратора. Новый чек можно будет отправить после решения по текущей заявке. ',
+      'Мы пришлём уведомление.'],
     rows: back('profile'),
   };
 }
